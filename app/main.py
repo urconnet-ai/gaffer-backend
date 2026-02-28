@@ -491,3 +491,36 @@ async def debug_ft(team_id: int):
             "current_gw": gw,
         }
 
+
+
+@app.get("/debug-ft2/{team_id}")
+async def debug_ft2(team_id: int):
+    """Calculate FT from history the correct way."""
+    import httpx as _httpx
+    async with _httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        r = await client.get(f"https://fantasy.premierleague.com/api/entry/{team_id}/history/")
+        data = r.json()
+    
+    current = data.get("current", [])
+    
+    # Walk through each GW and simulate FT accumulation
+    # Rules: start with 1 FT, gain 1 per GW unused, max 5
+    ft = 1
+    breakdown = []
+    for gw in current:
+        event          = gw.get("event")
+        made           = gw.get("event_transfers", 0)
+        cost           = gw.get("event_transfers_cost", 0)
+        free_used      = made if cost == 0 else max(0, made - (cost // 4))
+        ft_after       = min(5, ft - free_used + 1)
+        breakdown.append({
+            "gw": event, "made": made, "cost": cost,
+            "ft_before": ft, "free_used": free_used, "ft_after": ft_after
+        })
+        ft = ft_after
+    
+    return {
+        "calculated_ft": ft,
+        "last_5_gws": breakdown[-5:] if breakdown else []
+    }
+
