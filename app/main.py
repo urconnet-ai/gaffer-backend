@@ -148,14 +148,21 @@ async def get_briefing(team_id: int):
                     current_event = current[-1]["event"] if current else 19
                     in_second_half = current_event >= 20
 
-                    wc_h1 = any(c["name"] == "wildcard" and c.get("event", 0) <= 19 for c in chips_used)
-                    wc_h2 = any(c["name"] == "wildcard" and c.get("event", 0) >= 20 for c in chips_used)
+                    def _ch(name, half):
+                        return any(c["name"] == name and (
+                            (half == 1 and c.get("event", 0) <= 19) or
+                            (half == 2 and c.get("event", 0) >= 20)
+                        ) for c in chips_used)
+
                     chip_availability = {
-                        "wildcard_h1": not wc_h1,
-                        "wildcard_h2": not wc_h2,
-                        "freehit":     "freehit" not in [c["name"] for c in chips_used],
-                        "bboost":      "bboost"  not in [c["name"] for c in chips_used],
-                        "3xc":         "3xc"     not in [c["name"] for c in chips_used],
+                        "wildcard_h1": not _ch("wildcard", 1),
+                        "wildcard_h2": not _ch("wildcard", 2),
+                        "freehit_h1":  not _ch("freehit",  1),
+                        "freehit_h2":  not _ch("freehit",  2),
+                        "bboost_h1":   not _ch("bboost",   1),
+                        "bboost_h2":   not _ch("bboost",   2),
+                        "3xc_h1":      not _ch("3xc",      1),
+                        "3xc_h2":      not _ch("3xc",      2),
                         "in_second_half": in_second_half,
                         "current_event": current_event,
                     }
@@ -359,18 +366,35 @@ async def get_history(team_id: int):
         #   3xc:       1x total
         # chips[] from history shows USED chips with their event
 
-        used_chip_names = [c["name"] for c in chips]
+        # FPL CHIP RULES (2024/25+):
+        # ALL chips are available TWICE per season — once per half.
+        # Half 1 = GW1-19, Half 2 = GW20-38.
+        # A chip used in H1 does NOT remove the H2 version.
+        # chips[] shows event number — use that to determine which half was used.
 
-        # Wildcard is special — used in first half counts only for first half
-        wc_used_h1 = any(c["name"] == "wildcard" and c.get("event", 0) <= 19 for c in chips)
-        wc_used_h2 = any(c["name"] == "wildcard" and c.get("event", 0) >= 20 for c in chips)
+        def chip_used_in_half(name, half):
+            """half=1 means GW1-19, half=2 means GW20-38"""
+            for c in chips:
+                if c["name"] != name:
+                    continue
+                ev = c.get("event", 0)
+                if half == 1 and ev <= 19:
+                    return True
+                if half == 2 and ev >= 20:
+                    return True
+            return False
 
         chip_availability = {
-            "wildcard_h1":  not wc_used_h1,   # GW1-19 wildcard
-            "wildcard_h2":  not wc_used_h2,   # GW20-38 wildcard
-            "freehit":      "freehit" not in used_chip_names,
-            "bboost":       "bboost"  not in used_chip_names,
-            "3xc":          "3xc"     not in used_chip_names,
+            # Wildcard: separate H1 and H2 versions
+            "wildcard_h1": not chip_used_in_half("wildcard", 1),
+            "wildcard_h2": not chip_used_in_half("wildcard", 2),
+            # All others: also H1 and H2 separate
+            "freehit_h1":  not chip_used_in_half("freehit", 1),
+            "freehit_h2":  not chip_used_in_half("freehit", 2),
+            "bboost_h1":   not chip_used_in_half("bboost",  1),
+            "bboost_h2":   not chip_used_in_half("bboost",  2),
+            "3xc_h1":      not chip_used_in_half("3xc",     1),
+            "3xc_h2":      not chip_used_in_half("3xc",     2),
         }
 
         # Current GW to determine which half we are in
@@ -412,19 +436,26 @@ async def debug_chips(team_id: int):
     last_event  = current[-1]["event"] if current else 0
     in_h2       = last_event >= 20
     used_names  = [c["name"] for c in chips]
-    wc_h1 = any(c["name"] == "wildcard" and c.get("event", 0) <= 19 for c in chips)
-    wc_h2 = any(c["name"] == "wildcard" and c.get("event", 0) >= 20 for c in chips)
+    def _ch(name, half):
+        return any(c["name"] == name and (
+            (half == 1 and c.get("event", 0) <= 19) or
+            (half == 2 and c.get("event", 0) >= 20)
+        ) for c in chips)
+
     return {
-        "raw_chips":       chips,
-        "used_names":      used_names,
-        "last_event":      last_event,
-        "in_second_half":  in_h2,
+        "raw_chips":      chips,
+        "used_names":     used_names,
+        "last_event":     last_event,
+        "in_second_half": in_h2,
         "chip_availability": {
-            "wildcard_h1": not wc_h1,
-            "wildcard_h2": not wc_h2,
-            "freehit":     "freehit" not in used_names,
-            "bboost":      "bboost"  not in used_names,
-            "3xc":         "3xc"     not in used_names,
+            "wildcard_h1": not _ch("wildcard", 1),
+            "wildcard_h2": not _ch("wildcard", 2),
+            "freehit_h1":  not _ch("freehit",  1),
+            "freehit_h2":  not _ch("freehit",  2),
+            "bboost_h1":   not _ch("bboost",   1),
+            "bboost_h2":   not _ch("bboost",   2),
+            "3xc_h1":      not _ch("3xc",      1),
+            "3xc_h2":      not _ch("3xc",      2),
         }
     }
 

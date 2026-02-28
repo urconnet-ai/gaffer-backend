@@ -285,17 +285,22 @@ def _get_next_fixtures(team_id: int, events: list, fixtures: list) -> list:
 
 
 
-def _format_chips_available(squad_ctx: dict) -> str:
-    """Formats chip availability from picks data for Claude's prompt."""
-    chip = squad_ctx.get("chip_played")
-    if chip in ("wildcard", "freehit"):
-        return f"Currently playing {chip} — unlimited free transfers this GW"
-    # Squad picks endpoint does not expose full chip history
-    # The analysis endpoint fetches history separately and passes it
-    # For now signal what we know
-    return "Check chip_availability field from /history for full status"
+def _format_chips_available(chip_availability: dict, in_h2: bool) -> str:
+    """Format available chips for Claude — all 4 chips have H1 and H2 versions."""
+    if not chip_availability:
+        return "CHIPS AVAILABLE: Unknown"
+    suffix = "_h2" if in_h2 else "_h1"
+    window = "GW20-38" if in_h2 else "GW1-19"
+    avail = []
+    for chip, label in [("wildcard","Wildcard"), ("3xc","Triple Captain"),
+                         ("bboost","Bench Boost"), ("freehit","Free Hit")]:
+        if chip_availability.get(f"{chip}{suffix}"):
+            avail.append(label)
+    if not avail:
+        return f"CHIPS AVAILABLE: None remaining in current window ({window})"
+    return f"CHIPS AVAILABLE ({window}): {', '.join(avail)}"
 
-def build_squad_prompt_context(team_data: dict, squad_ctx: dict) -> str:
+def build_squad_prompt_context(team_data: dict, squad_ctx: dict, chip_availability: dict = None) -> str:
     """
     Builds a rich plain-text squad summary for Claude.
     Uses selling prices, flags availability, shows this GW's transfers.
@@ -327,6 +332,7 @@ def build_squad_prompt_context(team_data: dict, squad_ctx: dict) -> str:
         f"TOTAL POINTS: {team_data.get('summary_overall_points', '?')}",
         f"BANK: £{bank:.1f}m | FREE TRANSFERS: {'Unlimited (chip active)' if ftb == 99 else ftb}",
         f"CHIP ACTIVE THIS GW: {chip or 'None'}",
+        f"{_format_chips_available(chip_availability or {}, squad_ctx.get('in_second_half', False))}",
         "",
         "── STARTING XI ──",
     ]
