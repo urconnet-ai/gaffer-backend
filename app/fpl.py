@@ -69,8 +69,36 @@ async def get_gameweek_info() -> Optional[dict]:
         r.raise_for_status()
         data   = r.json()
         events = data.get("events", [])
+        from datetime import datetime, timezone
+        now        = datetime.now(timezone.utc)
+
         current_gw = next((e for e in events if e.get("is_current")), None)
         next_gw    = next((e for e in events if e.get("is_next")), None)
+
+        # If deadline has already passed for next_gw, find the true upcoming one
+        # FPL sometimes has is_next lagging by a few hours after deadline
+        if next_gw:
+            dl = next_gw.get("deadline_time", "")
+            try:
+                dl_dt = datetime.fromisoformat(dl.replace("Z", "+00:00"))
+                if dl_dt < now:
+                    # Find first future deadline
+                    future = [e for e in events if not e.get("finished", True)]
+                    future.sort(key=lambda e: e.get("id", 999))
+                    next_gw = future[0] if future else next_gw
+            except Exception:
+                pass
+
+        # Also ensure current_gw deadline shows correctly
+        if current_gw:
+            dl = current_gw.get("deadline_time", "")
+            try:
+                dl_dt = datetime.fromisoformat(dl.replace("Z", "+00:00"))
+                if dl_dt < now and next_gw:
+                    current_gw = next_gw
+            except Exception:
+                pass
+
         return {"current": current_gw, "next": next_gw}
     except Exception as e:
         print(f"[fpl] get_gameweek_info error: {e}")

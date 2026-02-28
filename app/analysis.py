@@ -108,40 +108,69 @@ def build_market_context(bootstrap: dict, squad_ctx: dict) -> str:
 
 
 def build_prompt(squad_context: str, market_context: str) -> str:
-    return f"""You are Gaffer, an expert FPL AI co-manager. Your job is to give precise, squad-specific advice.
+    # Extract key squad constraints to force confidence variance
+    bank     = 0.0
+    ft       = 1
+    for line in squad_context.split("\n"):
+        if "BANK:" in line:
+            try:
+                bank = float(line.split("£")[1].split("m")[0])
+            except Exception:
+                pass
+        if "FREE TRANSFERS:" in line:
+            try:
+                ft = int(line.split("FREE TRANSFERS:")[1].strip().split()[0].replace("Unlimited", "99"))
+            except Exception:
+                pass
 
-READ THIS BEFORE ANSWERING:
-- Every recommendation must reference players actually in this squad by name.
-- BUDGET: Never suggest a transfer the manager cannot afford. If bank < £0.5m, only recommend like-for-like or cheaper swaps.
-- FREE TRANSFERS: If FT shown is 0, any transfer costs 4pts. Only recommend if clearly worth it. Say explicitly: "Requires a 4pt hit."
-- CHIPS: Only mention chips shown as available. Do not recommend chips already played. Only recommend playing NOW if this specific GW justifies it over waiting.
-- CAPTAIN: Must be a player already in the squad.
-- Be specific. Mention actual names, form scores, prices, and fixture opponents.
+    # Pre-calculate confidence modifier so Claude matches it
+    base_conf = 7.5
+    if bank < 0.3:
+        base_conf -= 1.2
+    elif bank < 1.0:
+        base_conf -= 0.5
+    if ft == 0:
+        base_conf -= 0.8
+    elif ft >= 2:
+        base_conf += 0.4
+    if ft >= 3:
+        base_conf += 0.5
+    conf_hint = round(min(9.5, max(4.0, base_conf)), 1)
 
-Reply using EXACTLY these six headers, nothing else before or after:
+    return f"""You are Gaffer, an expert FPL AI co-manager. Give precise, squad-specific advice only.
+
+HARD RULES:
+1. Reference actual players in this squad by name — never generic advice.
+2. BUDGET £{bank:.1f}m in bank. Never recommend a transfer the manager cannot afford.
+3. FREE TRANSFERS: {ft} available. If 0 FT, state "Requires 4pt hit" and only recommend if clearly worth it. If 2+ FT, be proactive.
+4. CHIPS: Only recommend chips marked AVAILABLE. Never recommend a chip that has been played.
+5. CONFIDENCE must be close to {conf_hint}/10 — adjust ±0.5 based on fixture clarity and squad depth, but anchor near {conf_hint}.
+6. CAPTAIN must be a player already in the squad.
+
+Reply using EXACTLY these six headers with nothing before or after:
 
 TRANSFER OUT
-[Player name (Team) £Xm] — [specific reason: form score, fixture run, injury risk, or price fall]
-OR: Hold — [why the squad is balanced enough not to move]
+[Player name (Team) £Xm] — [specific reason: form score, fixture run, injury, or price risk]
+OR: Hold — [why no move is needed given their budget of £{bank:.1f}m and {ft} FT]
 
 TRANSFER IN
-[Player name (Team) £Xm] — [form + fixture justification]
-Confirm it fits within the bank balance shown. If a hit is required, say: "Requires 4pt hit — worth it because X"
-OR: N/A if holding
+[Player name (Team) £Xm] — [form + fixture reason. Confirm it fits £{bank:.1f}m bank]
+If hit required: "Requires 4pt hit — worth it because [specific reason]"
+OR: N/A
 
 CAPTAIN
-[Player name (Team)] — [compare to 2–3 other options in the squad and explain why this player wins]
+[Player name (Team)] — beat [2 rivals from the squad] because [specific fixture/form reason]
 
 CHIP
-[Chip name] — [specific GW or trigger event that justifies playing it now]
-OR: Hold [chip name] — [name the better moment e.g. "DGW confirmed around GW32"]
+[Chip name] — [specific GW or trigger justifying playing NOW]
+OR: Hold [chip name] — [specific better moment e.g. confirmed DGW around GW32]
 
 CONFIDENCE
-X.X / 10 — [one-line reason: e.g. "tight budget limits options" or "clear weak link and obvious upgrade"]
+{conf_hint} / 10 — [one-line reason matching the squad situation]
 
 SUMMARY
-[One sentence: the single most urgent action this GW.]
-[One sentence: what to watch before the next deadline.]
+[Sentence 1: single most urgent action this GW]
+[Sentence 2: what to watch before next deadline]
 
 ---
 {squad_context}
