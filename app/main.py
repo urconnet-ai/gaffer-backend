@@ -524,3 +524,86 @@ async def debug_ft2(team_id: int):
         "last_5_gws": breakdown[-5:] if breakdown else []
     }
 
+
+
+@app.get("/fixtures")
+async def get_fixture_difficulty():
+    """
+    Returns next 5 GW fixtures for all 20 PL teams with FDR ratings.
+    Used by the fixture difficulty table on the frontend.
+    """
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            b = await client.get("https://fantasy.premierleague.com/api/bootstrap-static/")
+            f = await client.get("https://fantasy.premierleague.com/api/fixtures/")
+            b.raise_for_status(); f.raise_for_status()
+            bootstrap = b.json()
+            fixtures  = f.json()
+
+        teams    = {t["id"]: t for t in bootstrap.get("teams", [])}
+        events   = bootstrap.get("events", [])
+        
+        # Find current and next 5 GWs
+        current_gw = next((e["id"] for e in events if e.get("is_current")), None)
+        next_gw    = next((e["id"] for e in events if e.get("is_next")), None)
+        start_gw   = current_gw or next_gw or 29
+        gw_range   = list(range(start_gw, start_gw + 5))
+
+        # Build fixture map: team_id -> {gw: [{opp, home, fdr}]}
+        team_fixtures = {tid: {gw: [] for gw in gw_range} for tid in teams}
+
+        for fix in fixtures:
+            gw = fix.get("event")
+            if gw not in gw_range:
+                continue
+            if fix.get("finished"):
+                continue
+            h = fix.get("team_h")
+            a = fix.get("team_a")
+            h_fdr = fix.get("team_h_difficulty", 3)
+            a_fdr = fix.get("team_a_difficulty", 3)
+
+            if h in team_fixtures and gw in team_fixtures[h]:
+                team_fixtures[h][gw].append({
+                    "opp": teams.get(a, {}).get("short_name", "?"),
+                    "home": True,
+                    "fdr": h_fdr
+                })
+            if a in team_fixtures and gw in team_fixtures[a]:
+                team_fixtures[a][gw].append({
+                    "opp": teams.get(h, {}).get("short_name", "?"),
+                    "home": False,
+                    "fdr": a_fdr
+                })
+
+        # Build response sorted by team name
+        result = []
+        for tid, team in sorted(teams.items(), key=lambda x: x[1]["name"]):
+            gws = []
+            for gw in gw_range:
+                matches = team_fixtures[tid].get(gw, [])
+                gws.append({
+                    "gw": gw,
+                    "matches": matches,
+                    # avg fdr for sorting — blank = 6 (worst)
+                    "avg_fdr": round(sum(m["fdr"] for m in matches) / len(matches), 1) if matches else 6
+                })
+            result.append({
+                "id":        tid,
+                "name":      team["name"],
+                "short":     team["short_name"],
+                "gws":       gws,
+                "avg_fdr_5": round(sum(g["avg_fdr"] for g in gws) / 5, 1)
+            })
+
+        # Sort by easiest fixtures first
+        result.sort(key=lambda x: x["avg_fdr_5"])
+
+        return {"teams": result, "gw_range": gw_range}
+
+    except Exception as e:
+        import traceback
+        print(f"[fixtures] ERROR: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+

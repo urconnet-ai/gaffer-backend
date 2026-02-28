@@ -105,6 +105,35 @@ async def get_gameweek_info() -> Optional[dict]:
         return None
 
 
+
+async def calculate_free_transfers(team_id: int) -> int:
+    """
+    Calculate free transfers by walking through the full season history.
+    FPL does not expose this directly — must be derived.
+    Rules: start=1, gain 1 per GW, max 5, reduce by free transfers used.
+    A transfer is 'free' if event_transfers_cost == 0.
+    """
+    try:
+        r = await _client.get(f"{FPL_BASE}/entry/{team_id}/history/")
+        r.raise_for_status()
+        data    = r.json()
+        history = data.get("current", [])
+        ft = 1
+        for gw in history:
+            made = gw.get("event_transfers", 0)
+            cost = gw.get("event_transfers_cost", 0)
+            # free_used = transfers made without paying (cost=0 means all were free)
+            # if cost > 0, they paid 4pts per extra transfer, so free_used = made - (cost//4)
+            if cost == 0:
+                free_used = made
+            else:
+                free_used = max(0, made - (cost // 4))
+            ft = min(5, ft - free_used + 1)
+        return max(1, ft)
+    except Exception as e:
+        print(f"[fpl] calculate_free_transfers error: {e}")
+        return 1
+
 async def get_full_squad_context(team_id: int, bootstrap: dict, team_data: dict = None) -> dict:
     """
     Fetches actual GW squad picks and builds a rich context dict.
@@ -143,28 +172,12 @@ async def get_full_squad_context(team_id: int, bootstrap: dict, team_data: dict 
         bank = history.get("bank", 0) / 10
 
         # ── Free transfers calculation ─────────────────────────────────────────
-        # /entry/{id}/ → transfers.limit = FTs available RIGHT NOW (authoritative)
-        # This is exactly what the FPL website shows. Trust it directly.
+        # FPL does not expose FT directly (transfers.limit is always null).
+        # Must calculate by walking the full season history.
         if chip_played in ("wildcard", "freehit"):
             free_transfers = 99
         else:
-            tdata_transfers = team_data.get("transfers", {}) if team_data else {}
-            ft_limit = tdata_transfers.get("limit")
-
-            if ft_limit is not None:
-                # transfers.limit IS the current available FTs — no subtraction needed
-                # FPL updates this in real time as transfers are made
-                free_transfers = ft_limit
-            else:
-                # Fallback: infer from history entry_history
-                ft_made = history.get("event_transfers", 0)
-                ft_cost = history.get("event_transfers_cost", 0)
-                if ft_cost > 0:
-                    free_transfers = 0
-                elif ft_made == 0:
-                    free_transfers = 1
-                else:
-                    free_transfers = 0
+            free_transfers = await calculate_free_transfers(team_id)
 
         for pick in picks:
             player = players_by_id.get(pick["element"], {})
