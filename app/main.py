@@ -27,7 +27,7 @@ from app.analysis import generate_recommendation
 from app.notifications import send_briefing_email
 from app.database import save_user, get_user, get_all_active_users
 
-load_dotenv()
+load_dotenv(override=False)  # Never override Railway environment variables
 
 app = FastAPI(title="Gaffer API", version="1.0.0")
 
@@ -52,6 +52,19 @@ class BriefingRequest(BaseModel):
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
+
+@app.get("/debug-env")
+def debug_env():
+    """Temporary debug endpoint — remove before going public."""
+    import os
+    return {
+        "ANTHROPIC_API_KEY": "SET" if os.getenv("ANTHROPIC_API_KEY") else "MISSING",
+        "RESEND_API_KEY":    "SET" if os.getenv("RESEND_API_KEY")    else "MISSING",
+        "SUPABASE_URL":      "SET" if os.getenv("SUPABASE_URL")      else "MISSING",
+        "SUPABASE_API_KEY":  "SET" if os.getenv("SUPABASE_API_KEY")  else "MISSING",
+        "all_env_keys":      [k for k in os.environ.keys() if "ANTH" in k or "RESEND" in k or "SUPA" in k],
+    }
 
 @app.get("/")
 def root():
