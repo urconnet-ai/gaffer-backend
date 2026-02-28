@@ -459,3 +459,35 @@ async def debug_chips(team_id: int):
         }
     }
 
+
+
+@app.get("/debug-ft/{team_id}")
+async def debug_ft(team_id: int):
+    """Debug endpoint — shows exactly what FPL returns for transfers."""
+    import httpx as _httpx
+    async with _httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        # Entry summary
+        r1 = await client.get(f"https://fantasy.premierleague.com/api/entry/{team_id}/")
+        entry = r1.json()
+        
+        # Current GW picks
+        from app.fpl import get_gameweek_info
+        gw_info = await get_gameweek_info()
+        current = gw_info.get("current") or gw_info.get("next") or {}
+        gw = current.get("id", 29)
+        
+        r2 = await client.get(f"https://fantasy.premierleague.com/api/entry/{team_id}/event/{gw}/picks/")
+        picks = r2.json() if r2.status_code == 200 else {}
+        
+        entry_history = picks.get("entry_history", {})
+        
+        return {
+            "entry_transfers_object": entry.get("transfers"),
+            "entry_transfers_limit":  entry.get("transfers", {}).get("limit"),
+            "entry_transfers_made":   entry.get("transfers", {}).get("made"),
+            "entry_transfers_cost":   entry.get("transfers", {}).get("cost"),
+            "picks_event_transfers":      entry_history.get("event_transfers"),
+            "picks_event_transfers_cost": entry_history.get("event_transfers_cost"),
+            "current_gw": gw,
+        }
+
