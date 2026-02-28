@@ -143,34 +143,28 @@ async def get_full_squad_context(team_id: int, bootstrap: dict, team_data: dict 
         bank = history.get("bank", 0) / 10
 
         # ── Free transfers calculation ─────────────────────────────────────────
-        # FPL API exposes transfers.limit in the /entry/{id}/ response
-        # This is the cleanest source — it reflects banked FTs correctly.
-        # We pass team_data in (already fetched) and read directly from it.
-        # Fallback chain: team_data.transfers.limit → history inference → 1
+        # /entry/{id}/ → transfers.limit = FTs available RIGHT NOW (authoritative)
+        # This is exactly what the FPL website shows. Trust it directly.
         if chip_played in ("wildcard", "freehit"):
             free_transfers = 99
         else:
-            # Primary: read from team summary (transfers.limit)
             tdata_transfers = team_data.get("transfers", {}) if team_data else {}
             ft_limit = tdata_transfers.get("limit")
 
             if ft_limit is not None:
-                # Subtract any already made this GW
-                ft_made_this_gw = history.get("event_transfers", 0)
-                ft_cost         = history.get("event_transfers_cost", 0)
-                # If no cost, transfers were free — subtract from limit
-                free_deducted   = ft_made_this_gw if ft_cost == 0 else 0
-                free_transfers  = max(0, ft_limit - free_deducted)
+                # transfers.limit IS the current available FTs — no subtraction needed
+                # FPL updates this in real time as transfers are made
+                free_transfers = ft_limit
             else:
-                # Fallback: infer from history
-                ft_made  = history.get("event_transfers", 0)
-                ft_cost  = history.get("event_transfers_cost", 0)
+                # Fallback: infer from history entry_history
+                ft_made = history.get("event_transfers", 0)
+                ft_cost = history.get("event_transfers_cost", 0)
                 if ft_cost > 0:
                     free_transfers = 0
                 elif ft_made == 0:
-                    free_transfers = 1  # at least 1, may have 2 banked
+                    free_transfers = 1
                 else:
-                    free_transfers = max(0, ft_made - ft_made)
+                    free_transfers = 0
 
         for pick in picks:
             player = players_by_id.get(pick["element"], {})
