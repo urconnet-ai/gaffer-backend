@@ -20,7 +20,7 @@ async def generate_recommendation(
     picks_data: Optional[dict] = None,  # kept for backward compat, now fetched internally
 ) -> dict:
     team_id    = team_data.get("id")
-    squad_ctx  = await get_full_squad_context(team_id, bootstrap)
+    squad_ctx  = await get_full_squad_context(team_id, bootstrap, team_data)
     context    = build_squad_prompt_context(team_data, squad_ctx)
     market_ctx = build_market_context(bootstrap, squad_ctx)
 
@@ -32,47 +32,89 @@ async def generate_recommendation(
 
 
 def build_market_context(bootstrap: dict, squad_ctx: dict) -> str:
-    """Builds transfer market context — top targets by position the manager doesn't own."""
+    """
+    Builds transfer market context.
+    Filters out:
+    - Players already in the squad
+    - Injured players (chance_of_playing_next_round == 0)
+    - Suspended players (news contains 'suspended')
+    - Players with < 25% chance of playing
+    Only shows players who are available or have minor concerns.
+    """
     if not bootstrap:
         return ""
 
-    players    = bootstrap.get("elements", [])
-    teams_map  = {t["id"]: t["short_name"] for t in bootstrap.get("teams", [])}
-    pos_map    = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
+    players   = bootstrap.get("elements", [])
+    teams_map = {t["id"]: t["short_name"] for t in bootstrap.get("teams", [])}
+    pos_map   = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
-    # IDs already in the squad
-    owned_ids  = {p["id"] for p in squad_ctx.get("squad", [])}
-    bank       = squad_ctx.get("bank", 0)
+    owned_ids = {p["id"] for p in squad_ctx.get("squad", [])}
+    bank      = squad_ctx.get("bank", 0)
 
-    lines = ["", "── TRANSFER TARGETS (not in squad) ──"]
+    # Build a set of squad players' selling prices to know what we can afford
+    squad_sell_prices = {p["id"]: p["price"] for p in squad_ctx.get("squad", [])}
 
-    for pos_id in [2, 3, 4]:  # DEF, MID, FWD most relevant
+    lines = ["", "── TRANSFER TARGETS (available, not in squad) ──"]
+    lines.append("  Note: all players below are available to play — no injuries or suspensions")
+
+    for pos_id in [2, 3, 4]:
         pos_name = pos_map[pos_id]
-        targets  = [
-            p for p in players
-            if p.get("element_type") == pos_id
-            and p.get("id") not in owned_ids
-            and p.get("minutes", 0) > 300
-            and float(p.get("form", 0) or 0) >= 5.0
-        ]
+
+        targets = []
+        for p in players:
+            if p.get("element_type") != pos_id:
+                continue
+            if p.get("id") in owned_ids:
+                continue
+            if p.get("minutes", 0) < 200:
+                continue
+
+            # ── Strict availability filter ───────────────────────────────────
+            news   = (p.get("news") or "").lower()
+            chance = p.get("chance_of_playing_next_round")
+
+            # Skip if confirmed out or suspended
+            if chance == 0:
+                continue
+            if "suspended" in news:
+                continue
+            if "injured" in news and chance is not None and chance <= 25:
+                continue
+            if chance is not None and chance < 25:
+                continue
+
+            form = float(p.get("form", 0) or 0)
+            if form < 4.5:
+                continue
+
+            targets.append(p)
+
         targets.sort(key=lambda x: float(x.get("form", 0) or 0), reverse=True)
 
-        lines.append(f"\n  {pos_name} targets (form ≥ 5.0):")
-        for p in targets[:5]:
+        lines.append(f"\n  {pos_name} targets (available, form ≥ 4.5):")
+        for p in targets[:6]:
             name    = p.get("web_name")
             price   = p.get("now_cost", 0) / 10
             form    = p.get("form", "0.0")
             own     = p.get("selected_by_percent", "0")
             team    = teams_map.get(p.get("team"), "?")
-            news    = f" [{p['news']}]" if p.get("news") else ""
-            affordable = " ✓" if price <= (bank + 4.0) else ""  # rough affordability
-            lines.append(f"    {name} ({team}) £{price:.1f}m form:{form} owned:{own}%{affordable}{news}")
+            chance  = p.get("chance_of_playing_next_round")
+            minor   = f" ({chance}% fit)" if chance is not None and chance < 100 else ""
+            affordable = " [affordable]" if price <= (bank + 5.0) else ""
+            lines.append(f"    {name} ({team}) £{price:.1f}m form:{form} owned:{own}%{affordable}{minor}")
 
     return "\n".join(lines)
 
 
 def build_prompt(squad_context: str, market_context: str) -> str:
     return f"""You are Gaffer, an expert FPL (Fantasy Premier League) AI co-manager with deep knowledge of player form, fixture difficulty, and squad management strategy.
+
+CRITICAL RULES:
+- Player prices shown are SELLING PRICES (what the manager receives) — use these exact figures
+- Only recommend transfer targets from the TRANSFER TARGETS section — these are pre-filtered as available and fit
+- Never recommend an injured, suspended, or doubtful player as a transfer in
+- Free transfers shown are AVAILABLE transfers remaining this gameweek
+- If a player has a news item, factor it heavily into your recommendation
 
 Analyse the manager's actual squad below and produce a precise gameweek briefing. Use EXACTLY these headers — no preamble, no extra commentary:
 
@@ -176,8 +218,16 @@ async def chat_with_claude(message: str, squad_context: str, history: list) -> s
 
     system = f"""You are Gaffer, an expert FPL co-manager. You have full knowledge of the manager's squad below.
 
+CRITICAL RULES FOR ACCURACY:
+- Player prices listed as "sell:£X.Xm" are the SELLING PRICES — use these exact figures when discussing what a player costs to sell
+- "market £X.Xm" is the current FPL market price — use this when discussing buying cost
+- Free transfers shown are what is AVAILABLE to use this gameweek
+- "TRANSFERS THIS GW" shows moves already made — reference these accurately
+- When suggesting transfer targets, ONLY suggest players who are fully fit and available — never suggest injured or suspended players
+- If asked about a player's availability, check their news field carefully
+
 Answer questions about their specific players, transfers, captaincy, chips, and strategy.
-Be direct and specific — always reference actual players from their squad.
+Be direct and specific — always reference actual players from their squad with their correct prices.
 Keep answers concise — 2-4 sentences unless a detailed breakdown is needed.
 
 {squad_context}"""

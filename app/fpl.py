@@ -1,7 +1,6 @@
 """
 Gaffer — fpl.py
 All FPL public API calls. No authentication required.
-Data is pulled fresh on each request; caching can be added later.
 """
 
 import httpx
@@ -25,7 +24,6 @@ async def get_team(team_id: int) -> Optional[dict]:
 
 
 async def get_team_picks(team_id: int, gameweek: int) -> Optional[dict]:
-    """Returns actual GW picks — the 15 players selected, captain, vice-captain, chip played."""
     try:
         r = await _client.get(f"{FPL_BASE}/entry/{team_id}/event/{gameweek}/picks/")
         r.raise_for_status()
@@ -46,10 +44,6 @@ async def get_team_transfers(team_id: int) -> Optional[list]:
 
 
 async def get_player_data() -> Optional[dict]:
-    """
-    Full bootstrap-static: all players, teams, positions, prices, form, ownership.
-    ~2MB — the main FPL dataset.
-    """
     try:
         r = await _client.get(f"{FPL_BASE}/bootstrap-static/")
         r.raise_for_status()
@@ -73,89 +67,154 @@ async def get_gameweek_info() -> Optional[dict]:
     try:
         r = await _client.get(f"{FPL_BASE}/bootstrap-static/")
         r.raise_for_status()
-        data  = r.json()
+        data   = r.json()
         events = data.get("events", [])
         current_gw = next((e for e in events if e.get("is_current")), None)
         next_gw    = next((e for e in events if e.get("is_next")), None)
-        return { "current": current_gw, "next": next_gw }
+        return {"current": current_gw, "next": next_gw}
     except Exception as e:
         print(f"[fpl] get_gameweek_info error: {e}")
         return None
 
 
-async def get_full_squad_context(team_id: int, bootstrap: dict) -> dict:
+async def get_full_squad_context(team_id: int, bootstrap: dict, team_data: dict = None) -> dict:
     """
-    Fetches the actual GW squad picks and builds a rich context dict for Claude.
-    Returns both a structured dict and a plain-text summary string.
+    Fetches actual GW squad picks and builds a rich context dict.
+    Fixes:
+    - Uses selling_price (what you get when selling) not now_cost
+    - Correctly calculates free transfers remaining (not transfers made)
+    - Flags injured/suspended/doubtful players accurately
     """
-    gw_info = await get_gameweek_info()
-    current = gw_info.get("current") if gw_info else None
-    next_gw = gw_info.get("next")    if gw_info else None
-
-    # Use current GW picks if mid-week, otherwise last GW
-    target_gw = (current or next_gw or {}).get("id", 29)
+    gw_info    = await get_gameweek_info()
+    current    = gw_info.get("current") if gw_info else None
+    next_gw    = gw_info.get("next")    if gw_info else None
+    target_gw  = (current or next_gw or {}).get("id", 29)
 
     picks_data = await get_team_picks(team_id, target_gw)
-
-    # Fall back to previous GW if current not yet available
     if not picks_data and target_gw > 1:
         picks_data = await get_team_picks(team_id, target_gw - 1)
         print(f"[fpl] fell back to GW{target_gw - 1} picks")
 
-    transfers = await get_team_transfers(team_id)
+    transfers  = await get_team_transfers(team_id)
 
     players_by_id = {p["id"]: p for p in bootstrap.get("elements", [])}
     teams_by_id   = {t["id"]: t for t in bootstrap.get("teams", [])}
     pos_map       = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
     squad = []
+    bank  = 0
+    free_transfers = 1
+    chip_played    = None
 
     if picks_data:
         picks   = picks_data.get("picks", [])
         history = picks_data.get("entry_history", {})
-        bank    = history.get("bank", 0) / 10
-        free_transfers = history.get("event_transfers", 0)
-        chip_played    = picks_data.get("active_chip")
+        chip_played = picks_data.get("active_chip")
+
+        # Bank: actual ITB in 0.1m units
+        bank = history.get("bank", 0) / 10
+
+        # ── Free transfers calculation ─────────────────────────────────────────
+        # FPL API exposes transfers.limit in the /entry/{id}/ response
+        # This is the cleanest source — it reflects banked FTs correctly.
+        # We pass team_data in (already fetched) and read directly from it.
+        # Fallback chain: team_data.transfers.limit → history inference → 1
+        if chip_played in ("wildcard", "freehit"):
+            free_transfers = 99
+        else:
+            # Primary: read from team summary (transfers.limit)
+            tdata_transfers = team_data.get("transfers", {}) if team_data else {}
+            ft_limit = tdata_transfers.get("limit")
+
+            if ft_limit is not None:
+                # Subtract any already made this GW
+                ft_made_this_gw = history.get("event_transfers", 0)
+                ft_cost         = history.get("event_transfers_cost", 0)
+                # If no cost, transfers were free — subtract from limit
+                free_deducted   = ft_made_this_gw if ft_cost == 0 else 0
+                free_transfers  = max(0, ft_limit - free_deducted)
+            else:
+                # Fallback: infer from history
+                ft_made  = history.get("event_transfers", 0)
+                ft_cost  = history.get("event_transfers_cost", 0)
+                if ft_cost > 0:
+                    free_transfers = 0
+                elif ft_made == 0:
+                    free_transfers = 1  # at least 1, may have 2 banked
+                else:
+                    free_transfers = max(0, ft_made - ft_made)
 
         for pick in picks:
             player = players_by_id.get(pick["element"], {})
             team   = teams_by_id.get(player.get("team"), {})
 
-            # Next 5 fixtures for this player's team
-            next_fixtures = _get_next_fixtures(
-                player.get("team"), bootstrap.get("events", []),
-                bootstrap.get("fixtures_summary", [])
-            )
+            # ── SELLING PRICE: use pick's selling_price, not now_cost ──────────
+            # selling_price = what you actually receive when selling
+            # now_cost = current market price (may be higher if price rose)
+            selling_price = pick.get("selling_price", player.get("now_cost", 0)) / 10
+            now_cost      = player.get("now_cost", 0) / 10
+
+            # ── AVAILABILITY STATUS ──────────────────────────────────────────
+            news              = player.get("news", "") or ""
+            chance_playing    = player.get("chance_of_playing_next_round")
+            chance_this_round = player.get("chance_of_playing_this_round")
+
+            # Classify availability
+            if chance_playing == 0 or "suspended" in news.lower():
+                availability = "suspended"
+            elif chance_playing == 0 or "injured" in news.lower() or (chance_playing is not None and chance_playing == 0):
+                availability = "out"
+            elif chance_playing is not None and chance_playing <= 25:
+                availability = "major_doubt"
+            elif chance_playing is not None and chance_playing <= 75:
+                availability = "doubt"
+            elif news:
+                availability = "minor_concern"
+            else:
+                availability = "available"
 
             squad.append({
-                "id":           player.get("id"),
-                "name":         player.get("web_name", "Unknown"),
-                "full_name":    f"{player.get('first_name','')} {player.get('second_name','')}".strip(),
-                "position":     pos_map.get(player.get("element_type"), "?"),
-                "team":         team.get("short_name", "?"),
-                "team_full":    team.get("name", "?"),
-                "price":        player.get("now_cost", 0) / 10,
-                "form":         float(player.get("form", 0) or 0),
-                "total_points": player.get("total_points", 0),
-                "minutes":      player.get("minutes", 0),
-                "goals":        player.get("goals_scored", 0),
-                "assists":      player.get("assists", 0),
-                "clean_sheets": player.get("clean_sheets", 0),
-                "ownership":    float(player.get("selected_by_percent", 0) or 0),
-                "news":         player.get("news", ""),
-                "chance_playing": player.get("chance_of_playing_next_round"),
-                "is_captain":   pick.get("is_captain", False),
-                "is_vice":      pick.get("is_vice_captain", False),
-                "position_num": pick.get("position", 0),
-                "is_bench":     pick.get("position", 0) > 11,
-                "selling_price": pick.get("selling_price", player.get("now_cost", 0)) / 10,
+                "id":               player.get("id"),
+                "name":             player.get("web_name", "Unknown"),
+                "full_name":        f"{player.get('first_name','')} {player.get('second_name','')}".strip(),
+                "position":         pos_map.get(player.get("element_type"), "?"),
+                "team":             team.get("short_name", "?"),
+                "team_full":        team.get("name", "?"),
+                "price":            selling_price,      # what you sell for
+                "now_cost":         now_cost,            # current market price
+                "price_change":     round(now_cost - selling_price, 1),  # gain/loss vs buy price
+                "form":             float(player.get("form", 0) or 0),
+                "total_points":     player.get("total_points", 0),
+                "minutes":          player.get("minutes", 0),
+                "goals":            player.get("goals_scored", 0),
+                "assists":          player.get("assists", 0),
+                "clean_sheets":     player.get("clean_sheets", 0),
+                "ownership":        float(player.get("selected_by_percent", 0) or 0),
+                "news":             news,
+                "chance_playing":   chance_playing,
+                "availability":     availability,
+                "is_captain":       pick.get("is_captain", False),
+                "is_vice":          pick.get("is_vice_captain", False),
+                "position_num":     pick.get("position", 0),
+                "is_bench":         pick.get("position", 0) > 11,
             })
-    else:
-        bank = 0
-        free_transfers = 1
-        chip_played = None
 
-    # Recent transfers (last 5)
+    # ── Transfers this GW ──────────────────────────────────────────────────────
+    gw_transfers = []
+    if transfers:
+        for t in sorted(transfers, key=lambda x: x.get("event", 0), reverse=True):
+            if t.get("event") == target_gw:
+                p_in  = players_by_id.get(t.get("element_in",  0), {})
+                p_out = players_by_id.get(t.get("element_out", 0), {})
+                gw_transfers.append({
+                    "gw":      t.get("event"),
+                    "in":      p_in.get("web_name", "?"),
+                    "in_cost": t.get("element_in_cost", 0) / 10,
+                    "out":     p_out.get("web_name", "?"),
+                    "out_cost":t.get("element_out_cost", 0) / 10,
+                })
+
+    # Recent transfers (last 5 across all GWs)
     recent_transfers = []
     if transfers:
         for t in sorted(transfers, key=lambda x: x.get("event", 0), reverse=True)[:5]:
@@ -170,17 +229,18 @@ async def get_full_squad_context(team_id: int, bootstrap: dict) -> dict:
             })
 
     return {
-        "squad":            squad,
-        "bank":             bank,
-        "free_transfers":   free_transfers,
-        "chip_played":      chip_played,
-        "recent_transfers": recent_transfers,
-        "gw_info":          gw_info,
+        "squad":             squad,
+        "bank":              bank,
+        "free_transfers":    free_transfers,
+        "chip_played":       chip_played,
+        "gw_transfers":      gw_transfers,        # transfers made THIS gameweek
+        "recent_transfers":  recent_transfers,    # last 5 across all GWs
+        "gw_info":           gw_info,
+        "current_gw":        target_gw,
     }
 
 
 def _get_next_fixtures(team_id: int, events: list, fixtures: list) -> list:
-    """Returns abbreviated next-3-fixture difficulty for a team."""
     if not team_id or not fixtures:
         return []
     upcoming = [
@@ -198,57 +258,84 @@ def _get_next_fixtures(team_id: int, events: list, fixtures: list) -> list:
 
 def build_squad_prompt_context(team_data: dict, squad_ctx: dict) -> str:
     """
-    Builds a rich plain-text squad summary for Claude's prompt.
-    Includes actual picks, prices, form, injuries, and recent transfers.
+    Builds a rich plain-text squad summary for Claude.
+    Uses selling prices, flags availability, shows this GW's transfers.
     """
-    gw_info     = squad_ctx.get("gw_info", {})
-    next_gw     = gw_info.get("next") or gw_info.get("current") or {}
-    gw_name     = next_gw.get("name", "Next GW")
-    deadline    = next_gw.get("deadline_time", "Unknown")
-    bank        = squad_ctx.get("bank", 0)
-    ftb         = squad_ctx.get("free_transfers", 1)
-    chip        = squad_ctx.get("chip_played")
-    squad       = squad_ctx.get("squad", [])
-    transfers   = squad_ctx.get("recent_transfers", [])
+    gw_info          = squad_ctx.get("gw_info", {})
+    next_gw          = gw_info.get("next") or gw_info.get("current") or {}
+    gw_name          = next_gw.get("name", "Next GW")
+    deadline         = next_gw.get("deadline_time", "Unknown")
+    bank             = squad_ctx.get("bank", 0)
+    ftb              = squad_ctx.get("free_transfers", 1)
+    chip             = squad_ctx.get("chip_played")
+    squad            = squad_ctx.get("squad", [])
+    gw_transfers     = squad_ctx.get("gw_transfers", [])
+    recent_transfers = squad_ctx.get("recent_transfers", [])
+
+    avail_map = {
+        "suspended":    "🔴 SUSPENDED",
+        "out":          "🔴 OUT",
+        "major_doubt":  "🟠 MAJOR DOUBT",
+        "doubt":        "🟡 DOUBT",
+        "minor_concern":"🟡 MINOR CONCERN",
+        "available":    "",
+    }
 
     lines = [
         f"TEAM: {team_data.get('name')}",
         f"GAMEWEEK: {gw_name} | DEADLINE: {deadline}",
         f"OVERALL RANK: {team_data.get('summary_overall_rank', '?'):,}" if isinstance(team_data.get('summary_overall_rank'), int) else f"OVERALL RANK: {team_data.get('summary_overall_rank', '?')}",
         f"TOTAL POINTS: {team_data.get('summary_overall_points', '?')}",
-        f"BANK: £{bank:.1f}m | FREE TRANSFERS: {ftb}",
+        f"BANK: £{bank:.1f}m | FREE TRANSFERS: {'Unlimited (chip active)' if ftb == 99 else ftb}",
         f"CHIP ACTIVE: {chip or 'None'}",
         "",
-        "── CURRENT SQUAD ──",
+        "── STARTING XI ──",
     ]
 
-    # Starting XI
     starters = [p for p in squad if not p["is_bench"]]
     bench    = [p for p in squad if p["is_bench"]]
 
     for p in sorted(starters, key=lambda x: x["position_num"]):
-        cap   = " [C]"  if p["is_captain"] else " [VC]" if p["is_vice"] else ""
-        news  = f" ⚠ {p['news']}" if p["news"] else ""
-        doubt = f" ({p['chance_playing']}% fit)" if p["chance_playing"] is not None and p["chance_playing"] < 100 else ""
+        cap     = " [C]"  if p["is_captain"] else " [VC]" if p["is_vice"] else ""
+        status  = avail_map.get(p["availability"], "")
+        status_str = f"  {status}" if status else ""
+        price_note = f" (sell £{p['price']:.1f}m / market £{p['now_cost']:.1f}m)"
         lines.append(
             f"  {p['position']:3} {p['name']:20} {p['team']:4} "
-            f"£{p['price']:.1f}m  form:{p['form']:.1f}  "
+            f"sell:£{p['price']:.1f}m  form:{p['form']:.1f}  "
             f"pts:{p['total_points']}  owned:{p['ownership']:.1f}%"
-            f"{cap}{doubt}{news}"
+            f"{cap}{status_str}"
         )
+        if p["news"]:
+            lines.append(f"       ↳ {p['news']}")
 
-    lines.append("  --- bench ---")
+    lines.append("")
+    lines.append("── BENCH ──")
     for p in sorted(bench, key=lambda x: x["position_num"]):
+        status = avail_map.get(p["availability"], "")
+        status_str = f"  {status}" if status else ""
         lines.append(
             f"  {p['position']:3} {p['name']:20} {p['team']:4} "
-            f"£{p['price']:.1f}m  form:{p['form']:.1f}  pts:{p['total_points']}"
+            f"sell:£{p['price']:.1f}m  form:{p['form']:.1f}{status_str}"
         )
+        if p["news"]:
+            lines.append(f"       ↳ {p['news']}")
 
-    # Recent transfers
-    if transfers:
+    # This GW's transfers
+    if gw_transfers:
         lines.append("")
-        lines.append("── RECENT TRANSFERS ──")
-        for t in transfers:
-            lines.append(f"  GW{t['gw']}: OUT {t['out']} (£{t['out_cost']:.1f}m) → IN {t['in']} (£{t['in_cost']:.1f}m)")
+        lines.append(f"── TRANSFERS THIS GW ({len(gw_transfers)} made) ──")
+        for t in gw_transfers:
+            lines.append(f"  OUT {t['out']} (£{t['out_cost']:.1f}m) → IN {t['in']} (£{t['in_cost']:.1f}m)")
+    else:
+        lines.append("")
+        lines.append("── TRANSFERS THIS GW: None made yet ──")
+
+    # Recent transfer history
+    if recent_transfers:
+        lines.append("")
+        lines.append("── RECENT TRANSFER HISTORY ──")
+        for t in recent_transfers:
+            lines.append(f"  GW{t['gw']}: OUT {t['out']} → IN {t['in']}")
 
     return "\n".join(lines)

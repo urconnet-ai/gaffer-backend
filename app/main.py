@@ -201,7 +201,7 @@ async def chat(req: ChatRequest):
             raise HTTPException(status_code=404, detail="Team not found")
 
         bootstrap = await get_player_data()
-        squad_ctx = await get_full_squad_context(req.team_id, bootstrap or {})
+        squad_ctx = await get_full_squad_context(req.team_id, bootstrap or {}, team_data)
         squad_txt = build_squad_prompt_context(team_data, squad_ctx)
 
         reply = await chat_with_claude(req.message, squad_txt, req.history)
@@ -228,7 +228,7 @@ async def get_squad(team_id: int):
             raise HTTPException(status_code=404, detail="Team not found")
 
         bootstrap = await get_player_data()
-        squad_ctx = await get_full_squad_context(team_id, bootstrap or {})
+        squad_ctx = await get_full_squad_context(team_id, bootstrap or {}, team_data)
         return squad_ctx
 
     except HTTPException:
@@ -284,4 +284,61 @@ async def get_season():
     except Exception as e:
         print(f"[season] error: {e}")
         return {"season": "2025/26"}
+
+
+
+@app.get("/history/{team_id}")
+async def get_history(team_id: int):
+    """
+    Returns gameweek-by-gameweek points history for the season.
+    Used by the season performance chart.
+    """
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            r = await client.get(f"https://fantasy.premierleague.com/api/entry/{team_id}/history/")
+            r.raise_for_status()
+            data = r.json()
+
+        current = data.get("current", [])
+        chips   = data.get("chips", [])
+
+        # Build per-GW breakdown
+        gw_data = []
+        for gw in current:
+            gw_data.append({
+                "event":        gw.get("event"),
+                "points":       gw.get("points", 0),
+                "total_points": gw.get("total_points", 0),
+                "rank":         gw.get("rank"),
+                "overall_rank": gw.get("overall_rank"),
+                "bank":         gw.get("bank", 0) / 10,
+                "value":        gw.get("value", 0) / 10,
+                "event_transfers": gw.get("event_transfers", 0),
+                "event_transfers_cost": gw.get("event_transfers_cost", 0),
+                "points_on_bench": gw.get("points_on_bench", 0),
+                "chip":         next((c["name"] for c in chips if c.get("event") == gw.get("event")), None),
+            })
+
+        total_pts   = current[-1]["total_points"] if current else 0
+        avg_pts     = round(sum(g["points"] for g in gw_data) / len(gw_data), 1) if gw_data else 0
+        best_gw     = max(gw_data, key=lambda x: x["points"]) if gw_data else {}
+        worst_gw    = min(gw_data, key=lambda x: x["points"]) if gw_data else {}
+
+        return {
+            "gameweeks":   gw_data,
+            "chips_used":  chips,
+            "summary": {
+                "total_points": total_pts,
+                "avg_per_gw":   avg_pts,
+                "best_gw":      best_gw,
+                "worst_gw":     worst_gw,
+                "gws_played":   len(gw_data),
+            }
+        }
+
+    except Exception as e:
+        import traceback
+        print(f"[history] ERROR: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
 
