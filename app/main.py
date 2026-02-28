@@ -107,31 +107,42 @@ async def connect_team(req: ConnectRequest, background_tasks: BackgroundTasks):
     if req.email:
         background_tasks.add_task(send_initial_briefing, req.team_id, req.email)
 
-    # Fetch live GW points from history — summary_event_points lags during live GWs
-    gw_pts = team_data.get("summary_event_points") or 0
+    # Fetch live points + FT from history in one call
+    gw_pts  = team_data.get("summary_event_points") or 0
+    live_gw = team_data.get("summary_event_rank") and team_data.get("current_event")
+    free_transfers = 1
     try:
         import httpx as _httpx
-        async with _httpx.AsyncClient(timeout=6.0, headers={"User-Agent": "Mozilla/5.0"}) as hclient:
+        async with _httpx.AsyncClient(timeout=8.0, headers={"User-Agent": "Mozilla/5.0"}) as hclient:
             hr = await hclient.get(f"https://fantasy.premierleague.com/api/entry/{req.team_id}/history/")
             if hr.status_code == 200:
-                hdata    = hr.json()
-                current  = hdata.get("current", [])
+                hdata   = hr.json()
+                current = hdata.get("current", [])
                 if current:
-                    # Most recent GW entry has live points
-                    latest   = current[-1]
-                    gw_pts   = latest.get("points", gw_pts)
-                    live_gw  = latest.get("event")
-    except Exception:
-        live_gw = None
+                    latest  = current[-1]
+                    # Use history points — always accurate including live GW
+                    gw_pts  = latest.get("points", 0)
+                    live_gw = latest.get("event")
+                    # Calculate free transfers from full season history
+                    ft = 1
+                    for gw in current:
+                        made = gw.get("event_transfers", 0)
+                        cost = gw.get("event_transfers_cost", 0)
+                        free_used = made if cost == 0 else max(0, made - (cost // 4))
+                        ft = min(5, ft - free_used + 1)
+                    free_transfers = max(1, ft)
+    except Exception as e:
+        print(f"[connect] history fetch failed: {e}")
 
     return {
-        "team_id":      req.team_id,
-        "team_name":    team_data.get("name"),
-        "total_pts":    team_data.get("summary_overall_points"),
-        "gw_pts":       gw_pts,
-        "live_gw":      live_gw,
-        "overall_rank": team_data.get("summary_overall_rank"),
-        "message":      "Connected. Gaffer is now monitoring your squad.",
+        "team_id":        req.team_id,
+        "team_name":      team_data.get("name"),
+        "total_pts":      team_data.get("summary_overall_points"),
+        "gw_pts":         gw_pts,
+        "live_gw":        live_gw,
+        "free_transfers": free_transfers,
+        "overall_rank":   team_data.get("summary_overall_rank"),
+        "message":        "Connected. Gaffer is now monitoring your squad.",
     }
 
 
