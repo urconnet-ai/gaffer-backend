@@ -214,3 +214,41 @@ async def chat(req: ChatRequest):
         print(f"[chat] ERROR: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+@app.get("/squad/{team_id}")
+async def get_squad(team_id: int):
+    """
+    Returns full squad data with form, price, ownership, injury news.
+    Used by the frontend stats panel.
+    """
+    try:
+        team_data = await get_team(team_id)
+        if not team_data:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        bootstrap = await get_player_data()
+        squad_ctx = await get_full_squad_context(team_id, bootstrap or {})
+        return squad_ctx
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"[squad] ERROR: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/mode")
+async def update_mode(req: dict):
+    """Updates the management mode for a connected user."""
+    try:
+        team_id = req.get("team_id")
+        mode    = req.get("mode", "assisted")
+        if team_id:
+            await save_user({"team_id": team_id, "mode": mode})
+        return {"status": "ok", "mode": mode}
+    except Exception as e:
+        print(f"[mode] ERROR: {e}")
+        return {"status": "error"}
+
