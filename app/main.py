@@ -110,16 +110,32 @@ async def get_briefing(team_id: int):
     Generates and returns a full gameweek recommendation for the given team.
     This is the core AI endpoint — calls Claude with full squad + fixture context.
     """
-    team_data = await get_team(team_id)
-    if not team_data:
-        raise HTTPException(status_code=404, detail="Team not found")
+    try:
+        team_data = await get_team(team_id)
+        if not team_data:
+            raise HTTPException(status_code=404, detail="Team not found")
 
-    gw_info    = await get_gameweek_info()
-    players    = await get_player_data()
-    fixtures   = await get_fixtures()
+        print(f"[briefing] fetching data for team {team_id}: {team_data.get('name')}")
 
-    recommendation = await generate_recommendation(team_data, gw_info, players, fixtures)
-    return recommendation
+        gw_info  = await get_gameweek_info()
+        print(f"[briefing] gw_info fetched: {gw_info is not None}")
+
+        players  = await get_player_data()
+        print(f"[briefing] players fetched: {players is not None}")
+
+        fixtures = await get_fixtures()
+        print(f"[briefing] fixtures fetched: {fixtures is not None}")
+
+        recommendation = await generate_recommendation(team_data, gw_info, players, fixtures)
+        print(f"[briefing] recommendation generated successfully")
+        return recommendation
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"[briefing] ERROR: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/send-briefing")
