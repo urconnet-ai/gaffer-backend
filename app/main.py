@@ -252,3 +252,36 @@ async def update_mode(req: dict):
         print(f"[mode] ERROR: {e}")
         return {"status": "error"}
 
+
+
+@app.get("/season")
+async def get_season():
+    """Returns the current FPL season label pulled live from the FPL API."""
+    try:
+        bootstrap = await get_player_data()
+        if not bootstrap:
+            return {"season": "2025/26"}
+
+        # FPL events contain the season — derive from first event's deadline year
+        events = bootstrap.get("events", [])
+        if events:
+            # First event deadline tells us the season start year
+            first_deadline = events[0].get("deadline_time", "2025-08-01")
+            start_year     = int(first_deadline[:4])
+            season_label   = f"{start_year}/{str(start_year + 1)[-2:]}"
+        else:
+            season_label = "2025/26"
+
+        # Also return current GW
+        current_gw = next((e["name"] for e in events if e.get("is_current")), None)
+        next_gw    = next((e["name"] for e in events if e.get("is_next")),    None)
+
+        return {
+            "season":     season_label,
+            "current_gw": current_gw,
+            "next_gw":    next_gw,
+        }
+    except Exception as e:
+        print(f"[season] error: {e}")
+        return {"season": "2025/26"}
+
