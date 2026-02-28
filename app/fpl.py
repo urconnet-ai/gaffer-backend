@@ -332,7 +332,7 @@ def build_squad_prompt_context(team_data: dict, squad_ctx: dict, chip_availabili
         f"TOTAL POINTS: {team_data.get('summary_overall_points', '?')}",
         f"BANK: £{bank:.1f}m | FREE TRANSFERS: {'Unlimited (chip active)' if ftb == 99 else ftb}",
         f"CHIP ACTIVE THIS GW: {chip or 'None'}",
-        f"{_format_chips_available(chip_availability or {}, squad_ctx.get('in_second_half', False))}",
+        f"{_format_chips_available(chip_availability or {}, (chip_availability or {}).get('in_second_half', True))}",
         "",
         "── STARTING XI ──",
     ]
