@@ -397,3 +397,34 @@ async def get_history(team_id: int):
         print(f"[history] ERROR: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+@app.get("/debug-chips/{team_id}")
+async def debug_chips(team_id: int):
+    """Debug endpoint — shows raw chip data from FPL for a team."""
+    import httpx as _httpx
+    async with _httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        r = await client.get(f"https://fantasy.premierleague.com/api/entry/{team_id}/history/")
+        r.raise_for_status()
+        data = r.json()
+    chips       = data.get("chips", [])
+    current     = data.get("current", [])
+    last_event  = current[-1]["event"] if current else 0
+    in_h2       = last_event >= 20
+    used_names  = [c["name"] for c in chips]
+    wc_h1 = any(c["name"] == "wildcard" and c.get("event", 0) <= 19 for c in chips)
+    wc_h2 = any(c["name"] == "wildcard" and c.get("event", 0) >= 20 for c in chips)
+    return {
+        "raw_chips":       chips,
+        "used_names":      used_names,
+        "last_event":      last_event,
+        "in_second_half":  in_h2,
+        "chip_availability": {
+            "wildcard_h1": not wc_h1,
+            "wildcard_h2": not wc_h2,
+            "freehit":     "freehit" not in used_names,
+            "bboost":      "bboost"  not in used_names,
+            "3xc":         "3xc"     not in used_names,
+        }
+    }
+
