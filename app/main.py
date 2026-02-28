@@ -22,8 +22,8 @@ import httpx
 import os
 from dotenv import load_dotenv
 
-from app.fpl import get_team, get_player_data, get_fixtures, get_gameweek_info
-from app.analysis import generate_recommendation
+from app.fpl import get_team, get_player_data, get_fixtures, get_gameweek_info, get_full_squad_context, build_squad_prompt_context
+from app.analysis import generate_recommendation, chat_with_claude
 from app.notifications import send_briefing_email
 from app.database import save_user, get_user, get_all_active_users
 
@@ -179,3 +179,38 @@ async def send_initial_briefing(team_id: int, email: str):
         await send_briefing_email(email, team_data.get("name", "Your Team"), rec)
     except Exception as e:
         print(f"[briefing error] team {team_id}: {e}")
+
+
+# ── Chat ──────────────────────────────────────────────────────────────────────
+
+class ChatRequest(BaseModel):
+    team_id: int
+    message: str
+    history: list = []   # list of {role, content} for multi-turn
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    """
+    Conversational interface — ask anything about your squad.
+    Maintains conversation history for multi-turn dialogue.
+    """
+    try:
+        team_data = await get_team(req.team_id)
+        if not team_data:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        bootstrap = await get_player_data()
+        squad_ctx = await get_full_squad_context(req.team_id, bootstrap or {})
+        squad_txt = build_squad_prompt_context(team_data, squad_ctx)
+
+        reply = await chat_with_claude(req.message, squad_txt, req.history)
+        return {"reply": reply, "team_name": team_data.get("name")}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"[chat] ERROR: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
