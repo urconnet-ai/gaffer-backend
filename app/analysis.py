@@ -17,11 +17,12 @@ async def generate_recommendation(
     gw_info: dict,
     bootstrap: dict,
     fixtures: list,
-    picks_data: Optional[dict] = None,  # kept for backward compat, now fetched internally
+    picks_data: Optional[dict] = None,
+    chip_availability: dict = None,
 ) -> dict:
     team_id    = team_data.get("id")
     squad_ctx  = await get_full_squad_context(team_id, bootstrap, team_data)
-    context    = build_squad_prompt_context(team_data, squad_ctx)
+    context    = build_squad_prompt_context(team_data, squad_ctx, chip_availability)
     market_ctx = build_market_context(bootstrap, squad_ctx)
 
     prompt = build_prompt(context, market_ctx)
@@ -107,41 +108,40 @@ def build_market_context(bootstrap: dict, squad_ctx: dict) -> str:
 
 
 def build_prompt(squad_context: str, market_context: str) -> str:
-    return f"""You are Gaffer, an expert FPL (Fantasy Premier League) AI co-manager with deep knowledge of player form, fixture difficulty, and squad management strategy.
+    return f"""You are Gaffer, an expert FPL AI co-manager. Your job is to give precise, squad-specific advice.
 
-CRITICAL RULES:
-- Player prices shown are SELLING PRICES (what the manager receives) — use these exact figures
-- Only recommend transfer targets from the TRANSFER TARGETS section — these are pre-filtered as available and fit
-- Never recommend an injured, suspended, or doubtful player as a transfer in
-- Free transfers shown are AVAILABLE transfers remaining this gameweek
-- If a player has a news item, factor it heavily into your recommendation
+READ THIS BEFORE ANSWERING:
+- Every recommendation must reference players actually in this squad by name.
+- BUDGET: Never suggest a transfer the manager cannot afford. If bank < £0.5m, only recommend like-for-like or cheaper swaps.
+- FREE TRANSFERS: If FT shown is 0, any transfer costs 4pts. Only recommend if clearly worth it. Say explicitly: "Requires a 4pt hit."
+- CHIPS: Only mention chips shown as available. Do not recommend chips already played. Only recommend playing NOW if this specific GW justifies it over waiting.
+- CAPTAIN: Must be a player already in the squad.
+- Be specific. Mention actual names, form scores, prices, and fixture opponents.
 
-Analyse the manager's actual squad below and produce a precise gameweek briefing. Use EXACTLY these headers — no preamble, no extra commentary:
+Reply using EXACTLY these six headers, nothing else before or after:
 
 TRANSFER OUT
-Name one specific player to transfer out. State their name, team, price.
-Give one clear reason: form, injury risk, fixture, or price concern.
-If no transfer is needed, write: Hold — squad is well balanced.
+[Player name (Team) £Xm] — [specific reason: form score, fixture run, injury risk, or price fall]
+OR: Hold — [why the squad is balanced enough not to move]
 
 TRANSFER IN
-Name one specific player to bring in. State their name, team, price.
-Give one clear reason covering form, fixture difficulty, and ownership.
-Must be affordable given the available bank balance shown.
+[Player name (Team) £Xm] — [form + fixture justification]
+Confirm it fits within the bank balance shown. If a hit is required, say: "Requires 4pt hit — worth it because X"
+OR: N/A if holding
 
 CAPTAIN
-Name your captain pick. One player only.
-Give a specific reason: fixture, form, set piece role, or home/away advantage.
+[Player name (Team)] — [compare to 2–3 other options in the squad and explain why this player wins]
 
 CHIP
-State whether to play a chip this gameweek and which one.
-If no chip: Hold chips — [specific reason tied to upcoming fixtures].
+[Chip name] — [specific GW or trigger event that justifies playing it now]
+OR: Hold [chip name] — [name the better moment e.g. "DGW confirmed around GW32"]
 
 CONFIDENCE
-Score from 1.0 to 10.0.
-Format exactly: X.X / 10
+X.X / 10 — [one-line reason: e.g. "tight budget limits options" or "clear weak link and obvious upgrade"]
 
 SUMMARY
-Two sentences maximum. The single most important insight for this manager's specific squad.
+[One sentence: the single most urgent action this GW.]
+[One sentence: what to watch before the next deadline.]
 
 ---
 {squad_context}

@@ -121,7 +121,7 @@ async def connect_team(req: ConnectRequest, background_tasks: BackgroundTasks):
 async def get_briefing(team_id: int):
     """
     Generates and returns a full gameweek recommendation for the given team.
-    This is the core AI endpoint — calls Claude with full squad + fixture context.
+    Fetches chip availability from history to give Claude accurate context.
     """
     try:
         team_data = await get_team(team_id)
@@ -131,15 +131,41 @@ async def get_briefing(team_id: int):
         print(f"[briefing] fetching data for team {team_id}: {team_data.get('name')}")
 
         gw_info  = await get_gameweek_info()
-        print(f"[briefing] gw_info fetched: {gw_info is not None}")
-
         players  = await get_player_data()
-        print(f"[briefing] players fetched: {players is not None}")
-
         fixtures = await get_fixtures()
-        print(f"[briefing] fixtures fetched: {fixtures is not None}")
 
-        recommendation = await generate_recommendation(team_data, gw_info, players, fixtures)
+        # Fetch chip availability from history — critical for accurate recommendations
+        import httpx as _httpx
+        chip_availability = {}
+        in_second_half    = False
+        try:
+            async with _httpx.AsyncClient(timeout=8.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+                hr = await client.get(f"https://fantasy.premierleague.com/api/entry/{team_id}/history/")
+                if hr.status_code == 200:
+                    hdata      = hr.json()
+                    chips_used = hdata.get("chips", [])
+                    current    = hdata.get("current", [])
+                    current_event = current[-1]["event"] if current else 19
+                    in_second_half = current_event >= 20
+
+                    wc_h1 = any(c["name"] == "wildcard" and c.get("event", 0) <= 19 for c in chips_used)
+                    wc_h2 = any(c["name"] == "wildcard" and c.get("event", 0) >= 20 for c in chips_used)
+                    chip_availability = {
+                        "wildcard_h1": not wc_h1,
+                        "wildcard_h2": not wc_h2,
+                        "freehit":     "freehit" not in [c["name"] for c in chips_used],
+                        "bboost":      "bboost"  not in [c["name"] for c in chips_used],
+                        "3xc":         "3xc"     not in [c["name"] for c in chips_used],
+                        "in_second_half": in_second_half,
+                        "current_event": current_event,
+                    }
+                    print(f"[briefing] chips: {chip_availability}")
+        except Exception as ce:
+            print(f"[briefing] chip fetch failed: {ce}")
+
+        recommendation = await generate_recommendation(
+            team_data, gw_info, players, fixtures, chip_availability=chip_availability
+        )
         print(f"[briefing] recommendation generated successfully")
         return recommendation
 
@@ -325,9 +351,38 @@ async def get_history(team_id: int):
         best_gw     = max(gw_data, key=lambda x: x["points"]) if gw_data else {}
         worst_gw    = min(gw_data, key=lambda x: x["points"]) if gw_data else {}
 
+        # ── Chip availability ──────────────────────────────────────────────────
+        # FPL chip rules:
+        #   wildcard:  available twice per season — GW1-19 AND GW20-38 (separate)
+        #   freehit:   1x total
+        #   bboost:    1x total
+        #   3xc:       1x total
+        # chips[] from history shows USED chips with their event
+
+        used_chip_names = [c["name"] for c in chips]
+
+        # Wildcard is special — used in first half counts only for first half
+        wc_used_h1 = any(c["name"] == "wildcard" and c.get("event", 0) <= 19 for c in chips)
+        wc_used_h2 = any(c["name"] == "wildcard" and c.get("event", 0) >= 20 for c in chips)
+
+        chip_availability = {
+            "wildcard_h1":  not wc_used_h1,   # GW1-19 wildcard
+            "wildcard_h2":  not wc_used_h2,   # GW20-38 wildcard
+            "freehit":      "freehit" not in used_chip_names,
+            "bboost":       "bboost"  not in used_chip_names,
+            "3xc":          "3xc"     not in used_chip_names,
+        }
+
+        # Current GW to determine which half we are in
+        current_event = current[-1]["event"] if current else 19
+        in_second_half = current_event >= 20
+
         return {
-            "gameweeks":   gw_data,
-            "chips_used":  chips,
+            "gameweeks":          gw_data,
+            "chips_used":         chips,
+            "chip_availability":  chip_availability,
+            "in_second_half":     in_second_half,
+            "current_event":      current_event,
             "summary": {
                 "total_points": total_pts,
                 "avg_per_gw":   avg_pts,

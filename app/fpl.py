@@ -256,6 +256,17 @@ def _get_next_fixtures(team_id: int, events: list, fixtures: list) -> list:
     return result
 
 
+
+def _format_chips_available(squad_ctx: dict) -> str:
+    """Formats chip availability from picks data for Claude's prompt."""
+    chip = squad_ctx.get("chip_played")
+    if chip in ("wildcard", "freehit"):
+        return f"Currently playing {chip} — unlimited free transfers this GW"
+    # Squad picks endpoint does not expose full chip history
+    # The analysis endpoint fetches history separately and passes it
+    # For now signal what we know
+    return "Check chip_availability field from /history for full status"
+
 def build_squad_prompt_context(team_data: dict, squad_ctx: dict) -> str:
     """
     Builds a rich plain-text squad summary for Claude.
@@ -287,7 +298,7 @@ def build_squad_prompt_context(team_data: dict, squad_ctx: dict) -> str:
         f"OVERALL RANK: {team_data.get('summary_overall_rank', '?'):,}" if isinstance(team_data.get('summary_overall_rank'), int) else f"OVERALL RANK: {team_data.get('summary_overall_rank', '?')}",
         f"TOTAL POINTS: {team_data.get('summary_overall_points', '?')}",
         f"BANK: £{bank:.1f}m | FREE TRANSFERS: {'Unlimited (chip active)' if ftb == 99 else ftb}",
-        f"CHIP ACTIVE: {chip or 'None'}",
+        f"CHIP ACTIVE THIS GW: {chip or 'None'}",
         "",
         "── STARTING XI ──",
     ]
