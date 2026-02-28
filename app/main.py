@@ -107,13 +107,31 @@ async def connect_team(req: ConnectRequest, background_tasks: BackgroundTasks):
     if req.email:
         background_tasks.add_task(send_initial_briefing, req.team_id, req.email)
 
+    # Fetch live GW points from history — summary_event_points lags during live GWs
+    gw_pts = team_data.get("summary_event_points") or 0
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=6.0, headers={"User-Agent": "Mozilla/5.0"}) as hclient:
+            hr = await hclient.get(f"https://fantasy.premierleague.com/api/entry/{req.team_id}/history/")
+            if hr.status_code == 200:
+                hdata    = hr.json()
+                current  = hdata.get("current", [])
+                if current:
+                    # Most recent GW entry has live points
+                    latest   = current[-1]
+                    gw_pts   = latest.get("points", gw_pts)
+                    live_gw  = latest.get("event")
+    except Exception:
+        live_gw = None
+
     return {
-        "team_id":    req.team_id,
-        "team_name":  team_data.get("name"),
-        "total_pts":  team_data.get("summary_overall_points"),
-        "gw_pts":     team_data.get("summary_event_points"),
+        "team_id":      req.team_id,
+        "team_name":    team_data.get("name"),
+        "total_pts":    team_data.get("summary_overall_points"),
+        "gw_pts":       gw_pts,
+        "live_gw":      live_gw,
         "overall_rank": team_data.get("summary_overall_rank"),
-        "message":    "Connected. Gaffer is now monitoring your squad.",
+        "message":      "Connected. Gaffer is now monitoring your squad.",
     }
 
 
