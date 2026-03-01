@@ -844,33 +844,74 @@ async def submit_feedback(req: FeedbackRequest):
     }
     print(f"[FEEDBACK] {entry}")
 
-    # Write to Supabase if configured
     supabase_url = os.getenv("SUPABASE_URL", "")
     supabase_key = os.getenv("SUPABASE_API_KEY", "")
-    if supabase_url and supabase_key:
-        try:
-            async with _httpx.AsyncClient(timeout=6.0) as client:
-                r = await client.post(
-                    f"{supabase_url}/rest/v1/feedback",
-                    headers={
-                        "apikey":        supabase_key,
-                        "Authorization": f"Bearer {supabase_key}",
-                        "Content-Type":  "application/json",
-                        "Prefer":        "return=minimal",
-                    },
-                    json=entry,
-                )
-                if r.status_code not in (200, 201):
-                    print(f"[feedback] Supabase error {r.status_code}: {r.text}")
-        except Exception as e:
-            print(f"[feedback] Supabase write failed: {e}")
-    else:
-        # Fallback — append to local file
-        try:
-            import json
-            with open("/tmp/gaffer_feedback.jsonl", "a") as f:
-                f.write(json.dumps(entry) + "\n")
-        except Exception:
-            pass
 
-    return {"ok": True}
+    if not supabase_url or not supabase_key:
+        print("[feedback] Supabase env vars not set")
+        return {"ok": False, "error": "Supabase not configured"}
+
+    try:
+        async with _httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.post(
+                f"{supabase_url}/rest/v1/feedback",
+                headers={
+                    "apikey":        supabase_key,
+                    "Authorization": f"Bearer {supabase_key}",
+                    "Content-Type":  "application/json",
+                    "Prefer":        "return=minimal",
+                },
+                json=entry,
+            )
+            print(f"[feedback] Supabase response: {r.status_code} — {r.text[:200]}")
+            if r.status_code in (200, 201):
+                return {"ok": True}
+            # Surface the actual Supabase error so we can debug
+            return {"ok": False, "status": r.status_code, "error": r.text}
+    except Exception as e:
+        print(f"[feedback] Exception: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/debug-supabase")
+async def debug_supabase():
+    """Check Supabase connectivity and table access."""
+    import os, httpx as _httpx
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_key = os.getenv("SUPABASE_API_KEY", "")
+
+    if not supabase_url or not supabase_key:
+        return {"error": "SUPABASE_URL or SUPABASE_API_KEY not set"}
+
+    results = {}
+    async with _httpx.AsyncClient(timeout=8.0) as client:
+        # Test 1: can we read the feedback table?
+        r = await client.get(
+            f"{supabase_url}/rest/v1/feedback?limit=1",
+            headers={
+                "apikey":        supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
+            }
+        )
+        results["read_feedback"] = {"status": r.status_code, "body": r.text[:300]}
+
+        # Test 2: try a test insert
+        import datetime
+        r2 = await client.post(
+            f"{supabase_url}/rest/v1/feedback",
+            headers={
+                "apikey":        supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type":  "application/json",
+                "Prefer":        "return=minimal",
+            },
+            json={
+                "type":    "debug",
+                "message": "Supabase connectivity test",
+                "team_id": None,
+                "created_at": datetime.datetime.utcnow().isoformat(),
+            }
+        )
+        results["write_feedback"] = {"status": r2.status_code, "body": r2.text[:300]}
+
+    return results
