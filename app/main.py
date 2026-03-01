@@ -820,3 +820,31 @@ async def get_transfer_suggestions(team_id: int):
     except Exception as e:
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Feedback ──────────────────────────────────────────────────────────────────
+
+from pydantic import BaseModel as _BaseModel
+
+class FeedbackRequest(_BaseModel):
+    type:    str
+    message: str
+
+@app.post("/feedback")
+async def submit_feedback(req: FeedbackRequest):
+    """Log user feedback. Wire to email/Slack/DB as needed."""
+    import datetime
+    entry = {
+        "ts":      datetime.datetime.utcnow().isoformat(),
+        "type":    req.type,
+        "message": req.message,
+    }
+    print(f"[FEEDBACK] {entry}")
+    # Append to local file for now — swap for email/DB later
+    try:
+        with open("/tmp/gaffer_feedback.jsonl", "a") as f:
+            import json
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+    return {"ok": True}
