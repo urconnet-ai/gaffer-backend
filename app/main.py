@@ -120,17 +120,37 @@ async def connect_team(req: ConnectRequest, background_tasks: BackgroundTasks):
                 current = hdata.get("current", [])
                 if current:
                     latest  = current[-1]
-                    # Use history points — always accurate including live GW
-                    gw_pts  = latest.get("points", 0)
+                    # gross points = points scored + any transfer cost deducted
+                    # This matches what FPL website shows as your GW total
+                    raw_pts  = latest.get("points", 0)
+                    xfer_hit = latest.get("event_transfers_cost", 0)
+                    gw_pts   = raw_pts + xfer_hit
                     live_gw = latest.get("event")
-                    # Calculate free transfers from full season history
-                    ft = 1
-                    for gw in current:
-                        made = gw.get("event_transfers", 0)
-                        cost = gw.get("event_transfers_cost", 0)
-                        free_used = made if cost == 0 else max(0, made - (cost // 4))
-                        ft = min(5, ft - free_used + 1)
-                    free_transfers = max(1, ft)
+                    # Calculate free transfers by walking full season history
+                    # Rule: each GW you gain 1 FT (max 5). Using transfers costs FTs.
+                    # If cost=0, all transfers were free. If cost>0, paid 4pts each extra.
+                    ft = 1  # always start season with 1
+                    for gw_entry in current[:-1]:  # exclude current GW (not yet locked)
+                        made = gw_entry.get("event_transfers", 0)
+                        cost = gw_entry.get("event_transfers_cost", 0)
+                        if cost == 0:
+                            paid = 0
+                            free_used = min(made, ft)
+                        else:
+                            paid = cost // 4
+                            free_used = made - paid
+                        ft = min(5, max(0, ft - free_used) + 1)
+                    # Current GW: if already transferred this GW, subtract
+                    if current:
+                        cur = current[-1]
+                        made_now = cur.get("event_transfers", 0)
+                        cost_now = cur.get("event_transfers_cost", 0)
+                        if cost_now == 0:
+                            ft = max(0, ft - made_now)
+                        else:
+                            paid_now = cost_now // 4
+                            ft = max(0, ft - (made_now - paid_now))
+                    free_transfers = max(0, ft)
     except Exception as e:
         print(f"[connect] history fetch failed: {e}")
 
@@ -636,3 +656,167 @@ async def get_fixture_difficulty():
         print(f"[fixtures] ERROR: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+# ── Transfer Planner ──────────────────────────────────────────────────────────
+
+@app.get("/players/search")
+async def search_players(q: str = "", position: str = "", max_price: float = 0):
+    """
+    Search FPL players by name/team, filter by position and price.
+    Returns top 30 matches with form, price, ownership, next fixture.
+    """
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            br = await client.get("https://fantasy.premierleague.com/api/bootstrap-static/")
+            br.raise_for_status()
+            boot = br.json()
+
+        elements   = boot.get("elements", [])
+        teams      = {t["id"]: t["short_name"] for t in boot.get("teams", [])}
+        pos_map    = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
+
+        q_lower = q.lower().strip()
+        results = []
+
+        for p in elements:
+            if p.get("status") == "u":  # unavailable/removed
+                continue
+            pos = pos_map.get(p.get("element_type"), "?")
+            price = p.get("now_cost", 0) / 10
+            name  = f"{p.get('first_name','')} {p.get('second_name','')}".strip()
+            web_name = p.get("web_name", "")
+            team = teams.get(p.get("team"), "?")
+
+            # Filters
+            if q_lower and q_lower not in name.lower() and q_lower not in web_name.lower() and q_lower not in team.lower():
+                continue
+            if position and pos != position.upper():
+                continue
+            if max_price and price > max_price:
+                continue
+
+            results.append({
+                "id":         p["id"],
+                "name":       web_name,
+                "full_name":  name,
+                "team":       team,
+                "position":   pos,
+                "price":      price,
+                "form":       float(p.get("form") or 0),
+                "total_pts":  p.get("total_points", 0),
+                "owned_by":   float(p.get("selected_by_percent") or 0),
+                "goals":      p.get("goals_scored", 0),
+                "assists":    p.get("assists", 0),
+                "minutes":    p.get("minutes", 0),
+                "status":     p.get("status", "a"),  # a=available, d=doubt, i=injured
+                "news":       p.get("news", ""),
+                "pts_per_game": float(p.get("points_per_game") or 0),
+                "ict_index":  float(p.get("ict_index") or 0),
+                "xg_per90":   float(p.get("expected_goals_per_90") or 0),
+                "xa_per90":   float(p.get("expected_assists_per_90") or 0),
+                "clean_sheets": p.get("clean_sheets", 0),
+                "cost_change_event": p.get("cost_change_event", 0),  # price change this GW
+            })
+
+        # Sort by form desc, then total pts
+        results.sort(key=lambda x: (-x["form"], -x["total_pts"]))
+        return {"players": results[:40], "total": len(results)}
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/transfer-suggestions/{team_id}")
+async def get_transfer_suggestions(team_id: int):
+    """
+    AI-powered transfer suggestions for a specific team.
+    Compares squad players to in-form alternatives at same position and similar price.
+    """
+    try:
+        import httpx as _httpx
+        async with _httpx.AsyncClient(timeout=12.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            br = await client.get("https://fantasy.premierleague.com/api/bootstrap-static/")
+            pr = await client.get(f"https://fantasy.premierleague.com/api/entry/{team_id}/event/{{gw}}/picks/".replace("{gw}", "28"))
+            br.raise_for_status()
+            boot = br.json()
+
+        elements  = {p["id"]: p for p in boot.get("elements", [])}
+        teams     = {t["id"]: t["short_name"] for t in boot.get("teams", [])}
+        pos_map   = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
+
+        # Get squad context
+        squad_ctx = await get_full_squad_context(team_id)
+        if not squad_ctx:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        squad_players = squad_ctx.get("squad_players", [])
+        bank = squad_ctx.get("bank", 0)
+
+        suggestions = []
+        for sp in squad_players[:11]:  # starting XI only
+            pid   = sp.get("id")
+            if not pid or pid not in elements:
+                continue
+            p_el  = elements[pid]
+            pos   = p_el.get("element_type")
+            price = p_el.get("now_cost", 0)
+            form  = float(p_el.get("form") or 0)
+
+            # Find better options at same position, affordable
+            budget = price + int(bank * 10)
+            candidates = []
+            for el in boot.get("elements", []):
+                if el["id"] == pid: continue
+                if el.get("element_type") != pos: continue
+                if el.get("now_cost", 0) > budget: continue
+                if el.get("status") == "u": continue
+                el_form = float(el.get("form") or 0)
+                if el_form <= form + 0.5: continue  # must be meaningfully better
+                candidates.append(el)
+
+            candidates.sort(key=lambda x: (-float(x.get("form") or 0), -x.get("total_points", 0)))
+
+            if candidates:
+                best = candidates[0]
+                suggestions.append({
+                    "out": {
+                        "id":       pid,
+                        "name":     p_el.get("web_name"),
+                        "team":     teams.get(p_el.get("team"), "?"),
+                        "position": pos_map.get(pos, "?"),
+                        "price":    price / 10,
+                        "form":     form,
+                        "pts":      p_el.get("total_points", 0),
+                        "status":   p_el.get("status", "a"),
+                        "news":     p_el.get("news", ""),
+                    },
+                    "in": {
+                        "id":       best["id"],
+                        "name":     best.get("web_name"),
+                        "team":     teams.get(best.get("team"), "?"),
+                        "position": pos_map.get(pos, "?"),
+                        "price":    best.get("now_cost", 0) / 10,
+                        "form":     float(best.get("form") or 0),
+                        "pts":      best.get("total_points", 0),
+                        "owned_by": float(best.get("selected_by_percent") or 0),
+                        "xg_per90": float(best.get("expected_goals_per_90") or 0),
+                    },
+                    "form_gain":  round(float(best.get("form") or 0) - form, 1),
+                    "price_diff": round((best.get("now_cost", 0) - price) / 10, 1),
+                })
+
+        suggestions.sort(key=lambda x: -x["form_gain"])
+        return {
+            "suggestions":  suggestions[:5],
+            "bank":         bank,
+            "free_transfers": squad_ctx.get("free_transfers", 1),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
