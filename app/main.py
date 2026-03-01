@@ -829,22 +829,48 @@ from pydantic import BaseModel as _BaseModel
 class FeedbackRequest(_BaseModel):
     type:    str
     message: str
+    team_id: int | None = None
 
 @app.post("/feedback")
 async def submit_feedback(req: FeedbackRequest):
-    """Log user feedback. Wire to email/Slack/DB as needed."""
-    import datetime
+    """Log user feedback to Supabase feedback table."""
+    import datetime, os, httpx as _httpx
+
     entry = {
-        "ts":      datetime.datetime.utcnow().isoformat(),
-        "type":    req.type,
-        "message": req.message,
+        "type":       req.type,
+        "message":    req.message,
+        "team_id":    req.team_id,
+        "created_at": datetime.datetime.utcnow().isoformat(),
     }
     print(f"[FEEDBACK] {entry}")
-    # Append to local file for now — swap for email/DB later
-    try:
-        with open("/tmp/gaffer_feedback.jsonl", "a") as f:
+
+    # Write to Supabase if configured
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_key = os.getenv("SUPABASE_API_KEY", "")
+    if supabase_url and supabase_key:
+        try:
+            async with _httpx.AsyncClient(timeout=6.0) as client:
+                r = await client.post(
+                    f"{supabase_url}/rest/v1/feedback",
+                    headers={
+                        "apikey":        supabase_key,
+                        "Authorization": f"Bearer {supabase_key}",
+                        "Content-Type":  "application/json",
+                        "Prefer":        "return=minimal",
+                    },
+                    json=entry,
+                )
+                if r.status_code not in (200, 201):
+                    print(f"[feedback] Supabase error {r.status_code}: {r.text}")
+        except Exception as e:
+            print(f"[feedback] Supabase write failed: {e}")
+    else:
+        # Fallback — append to local file
+        try:
             import json
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
+            with open("/tmp/gaffer_feedback.jsonl", "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception:
+            pass
+
     return {"ok": True}
